@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # !!! ЗАМІНИ ЦЕ ПОСИЛАННЯ на raw-URL свого файлу Dmusic на GitHub !!!
-DMUSIC_RAW_URL="https://raw.githubusercontent.com/<твій_акаунт>/dmusic/main/Dmusic"
+DMUSIC_RAW_URL="https://raw.githubusercontent.com/limbo099/dmusic/main/Dmusic"
 
 INSTALL_PATH="/usr/local/bin/Dmusic"
 
