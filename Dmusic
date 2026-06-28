@@ -1,19 +1,87 @@
 #!/usr/bin/env bash
 # ==========================================
-# ДІДО-КАЧАТОР 4000 PRO MAX (Arch Edition, Reliable Build)
+# Dmusic — Spotify / YouTube playlist downloader
 # ==========================================
 set -uo pipefail
 
-# ---------- Налаштування ----------
-WORK_ROOT="$HOME/Music"
-TMP_PREFIX="didokachator"
+DMUSIC_VERSION="6.0"
 
-# ---------- Допоміжні функції ----------
+# ---------- Colors / decor ----------
+if [ -t 1 ]; then
+    C_RESET='\033[0m'
+    C_BOLD='\033[1m'
+    C_CYAN='\033[36m'
+    C_GREEN='\033[32m'
+    C_YELLOW='\033[33m'
+    C_RED='\033[31m'
+    C_DIM='\033[2m'
+else
+    C_RESET=''; C_BOLD=''; C_CYAN=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_DIM=''
+fi
+
+banner() {
+    echo -e "${C_CYAN}${C_BOLD}"
+    echo "  ____                  _      "
+    echo " |  _ \ _ __ ___  _   _| |_ ___ "
+    echo " | | | | '_ \` _ \| | | | __/ __|"
+    echo " | |_| | | | | | | |_| | |_\__ \\"
+    echo " |____/|_| |_| |_|\__,_|\__|___/"
+    echo -e "${C_RESET}${C_DIM}        Music Downloader v${DMUSIC_VERSION}${C_RESET}"
+    echo ""
+}
+
+# ---------- Settings ----------
+WORK_ROOT="$HOME/Music"
+TMP_PREFIX="dmusic"
+
+# ---------- Command: Dmusic info ----------
+show_info() {
+    banner
+    cat <<EOF
+${C_BOLD}FEATURES:${C_RESET}
+  • Download from YouTube (video/playlist) and Spotify (track/playlist/album)
+  • For Spotify, the track list is fetched via 3 fallback methods:
+    1) your local Spotify client (playerctl)
+    2) anonymous Spotify API token
+    3) HTML scraping of the playlist page
+    4) manual track list entry (last resort)
+  • Output modes: separate mp3 files OR a single merged file (mp3/ogg)
+  • Automatic retry on temporary YouTube errors (e.g. 403)
+  • Correct track order preserved when merging
+  • Live progress: [current/total] tracks, and % progress during merge/encode
+
+${C_BOLD}MUSIC IS SAVED TO:${C_RESET}
+  ${WORK_ROOT}/<name_you_choose>/
+
+  Example: if you name your project "roadtrip", files will be at:
+  ${WORK_ROOT}/roadtrip/
+
+${C_BOLD}DEPENDENCIES (must be installed):${C_RESET}
+  yt-dlp, ffmpeg, curl, jq
+  Optional: playerctl (for automatic Spotify track-list detection)
+
+${C_BOLD}COMMANDS:${C_RESET}
+  Dmusic         — run the interactive download flow
+  Dmusic info    — show this help
+
+${C_BOLD}REPOSITORY:${C_RESET}
+  https://github.com/limbo099/dmusic
+
+EOF
+}
+
+if [ "${1:-}" == "info" ]; then
+    show_info
+    exit 0
+fi
+
+# ---------- Helper functions ----------
 
 log()  { echo -e "$1"; }
-fail() { echo "ПОМИЛКА: $1" >&2; exit 1; }
+ok()   { echo -e "${C_GREEN}✔${C_RESET} $1"; }
+warn() { echo -e "${C_YELLOW}⚠${C_RESET} $1"; }
+fail() { echo -e "${C_RED}✘ ERROR:${C_RESET} $1" >&2; exit 1; }
 
-# Перевірка залежностей
 check_deps() {
     local missing=()
     for cmd in yt-dlp ffmpeg curl jq; do
@@ -21,21 +89,19 @@ check_deps() {
     done
 
     if [ "${#missing[@]}" -gt 0 ]; then
-        echo "Бракує наступних утиліт: ${missing[*]}"
-        echo "Встанови їх командою:"
+        echo "Missing tools: ${missing[*]}"
+        echo "Install them with:"
         echo "  sudo pacman -S ${missing[*]}"
-        echo "(якщо yt-dlp немає в офіційних репо — sudo pacman -S yt-dlp, або через AUR: yt-dlp-git)"
+        echo "(if yt-dlp isn't in official repos, try AUR: yt-dlp-git)"
         exit 1
     fi
 }
 
-# Очищення тимчасових файлів (викликається завжди при виході)
 cleanup() {
     [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
-# Безпечна нормалізація імені файлу/папки (зберігає кирилицю, прибирає тільки небезпечні символи)
 sanitize_name() {
     local name="$1"
     name=$(echo "$name" | tr ' ' '_')
@@ -43,28 +109,35 @@ sanitize_name() {
     echo "$name"
 }
 
-# Отримати назву Spotify-об'єкта без авторизації (публічний oEmbed)
+# Get a Spotify object's title without authorization (public oEmbed)
 get_spotify_title() {
     local url="$1"
     local json title
     json=$(curl -s "https://open.spotify.com/oembed?url=${url}")
-    [ -z "$json" ] && fail "Не вдалося звʼязатися з Spotify oEmbed (перевір інтернет)."
+    [ -z "$json" ] && fail "Could not reach Spotify oEmbed (check your internet connection)."
     title=$(echo "$json" | jq -r '.title // empty')
-    [ -z "$title" ] && fail "Spotify не повернув назву. Можливо, посилання некоректне."
+    [ -z "$title" ] && fail "Spotify did not return a title. The link may be invalid."
     echo "$title"
 }
 
-# Завантажити один трек за назвою через пошук на YouTube (без офіційного API)
-# index — порядковий номер треку в плейлисті, додається як префікс до імені файлу,
-# щоб після склеювання порядок треків точно відповідав оригінальному плейлисту
-# (звичайне алфавітне сортування імен файлів з YouTube цього не гарантує).
+# Download one track by name via YouTube search (no official API needed)
+# index — track position in the playlist, used as a filename prefix so the
+# final merge preserves the original playlist order (plain alphabetical
+# sorting of YouTube-derived filenames would not guarantee that).
 download_by_search() {
     local query="$1"
     local outdir="$2"
     local index="${3:-0}"
+    local current="${4:-0}"
+    local total="${5:-0}"
     local prefix
     prefix=$(printf "%03d" "$index")
-    log "==> Шукаю на YouTube: $query"
+
+    if [ "$total" -gt 0 ]; then
+        log "${C_CYAN}[${current}/${total}]${C_RESET} Searching YouTube: ${C_BOLD}${query}${C_RESET}"
+    else
+        log "${C_CYAN}→${C_RESET} Searching YouTube: ${C_BOLD}${query}${C_RESET}"
+    fi
 
     local attempt max_attempts=3
     for attempt in 1 2 3; do
@@ -74,64 +147,140 @@ download_by_search() {
             --format "bestaudio/best" \
             --extract-audio --audio-format mp3 \
             --output "${outdir}/${prefix}_%(title)s.%(ext)s" \
+            --quiet --no-warnings \
             -- "$query"; then
+            ok "Downloaded: $query"
             return 0
         fi
 
         if [ "$attempt" -lt "$max_attempts" ]; then
-            log "    [спроба $attempt не вдалась (можливо, тимчасовий 403 від YouTube), повтор через 3с...]"
+            warn "Attempt $attempt failed (possibly a temporary YouTube 403), retrying in 3s..."
             sleep 3
         fi
     done
 
-    log "    [пропускаю: не вдалося знайти/завантажити '$query' після $max_attempts спроб]"
+    warn "Skipping '$query' after $max_attempts failed attempts"
 }
 
-# Завантажити пряме YouTube-посилання (відео або плейлист)
+# Download a direct YouTube URL (video or playlist)
 download_youtube_url() {
     local url="$1"
     local outdir="$2"
-    log "==> Бачу YouTube. Качаю напряму..."
+    log "${C_CYAN}→${C_RESET} YouTube link detected. Downloading directly..."
     yt-dlp \
         --ignore-errors \
         --format "bestaudio/best" \
         --extract-audio --audio-format mp3 \
         --output "${outdir}/%(playlist_index|1)03d_%(title)s.%(ext)s" \
+        --progress \
         "$url"
 }
 
-# Безпечне склеювання всіх mp3 у папці в один файл (екранує апострофи/пробіли коректно для ffmpeg concat)
+# Print a simple percentage progress bar to the current line
+print_progress_bar() {
+    local pct="$1"
+    local label="$2"
+    local width=30
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    local bar
+    bar=$(printf "%${filled}s" | tr ' ' '#')
+    bar+=$(printf "%${empty}s" | tr ' ' '-')
+    printf "\r${C_CYAN}%s${C_RESET} [%s] %3d%%" "$label" "$bar" "$pct"
+}
+
+# Run an ffmpeg encode/transcode step while showing a live % progress bar,
+# based on parsing ffmpeg's machine-readable -progress output against a
+# known total duration (in whole seconds) passed in by the caller.
+ffmpeg_with_progress() {
+    local label="$1"; shift
+    local duration="$1"; shift
+    local progress_file="${TMP_DIR}/ffmpeg_progress.txt"
+
+    if [ -z "$duration" ] || ! [[ "$duration" =~ ^[0-9]+$ ]]; then
+        duration=0
+    fi
+
+    ffmpeg -y -progress "$progress_file" -nostats "$@" </dev/null >/dev/null 2>"${TMP_DIR}/ffmpeg_stderr.log" &
+    local ffmpeg_pid=$!
+
+    while kill -0 "$ffmpeg_pid" 2>/dev/null; do
+        if [ -f "$progress_file" ] && [ "$duration" -gt 0 ]; then
+            local out_time_us
+            out_time_us=$(grep -a "out_time_us=" "$progress_file" 2>/dev/null | tail -1 | cut -d'=' -f2)
+            if [ -n "$out_time_us" ] && [[ "$out_time_us" =~ ^[0-9]+$ ]]; then
+                local out_seconds=$(( out_time_us / 1000000 ))
+                local pct=$(( out_seconds * 100 / duration ))
+                [ "$pct" -gt 100 ] && pct=100
+                print_progress_bar "$pct" "$label"
+            fi
+        fi
+        sleep 0.3
+    done
+
+    wait "$ffmpeg_pid"
+    local exit_code=$?
+    print_progress_bar 100 "$label"
+    echo ""
+
+    if [ $exit_code -ne 0 ]; then
+        echo "---- ffmpeg error details ----" >&2
+        cat "${TMP_DIR}/ffmpeg_stderr.log" >&2
+        echo "-------------------------------" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Estimate total duration (whole seconds) of an ffmpeg concat list by
+# summing the duration of each listed input file via ffprobe.
+estimate_concat_duration() {
+    local list_file="$1"
+    local total=0
+    local path
+    while IFS= read -r line; do
+        # lines look like: file '/abs/path/to/file.mp3'
+        path=$(echo "$line" | sed -n "s/^file '\(.*\)'$/\1/p" | sed "s/'\\\\''/'/g")
+        [ -z "$path" ] && continue
+        local d
+        d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$path" 2>/dev/null)
+        d=${d%.*}
+        [[ "$d" =~ ^[0-9]+$ ]] && total=$(( total + d ))
+    done < "$list_file"
+    echo "$total"
+}
+
+# Safely merge all mp3 files in a folder into a single file
+# (correctly escapes apostrophes/spaces/unicode for ffmpeg concat).
 merge_mp3_files() {
     local dir="$1"
     local list_file="$2"
     local out_file="$3"
 
     > "$list_file"
-    # find -print0 + read -d '' — єдиний надійний спосіб обробити імена з пробілами/апострофами/кирилицею
     while IFS= read -r -d '' f; do
-        # ВАЖЛИВО: пишемо ПОВНИЙ абсолютний шлях, бо list_file лежить в іншій
-        # тимчасовій папці (TMP_DIR), а не поряд із самими mp3 — ffmpeg шукає
-        # відносні шляхи відносно розташування list.txt, а не поточної директорії.
+        # IMPORTANT: write the FULL absolute path — list_file lives in a
+        # different temp directory than the mp3s, and ffmpeg resolves
+        # relative paths relative to list.txt's location, not the cwd.
         local abs_path
         abs_path=$(realpath "$f")
         local escaped="${abs_path//\'/\'\\\'\'}"
         printf "file '%s'\n" "$escaped" >> "$list_file"
     done < <(find "$dir" -maxdepth 1 -type f -name '*.mp3' -print0 | sort -z)
 
-    [ -s "$list_file" ] || fail "Жодного mp3-файлу не знайдено для склеювання."
+    [ -s "$list_file" ] || fail "No mp3 files found to merge."
 
-    local ffmpeg_err
-    ffmpeg_err=$(ffmpeg -y -f concat -safe 0 -i "$list_file" -c copy "$out_file" 2>&1 >/dev/null)
-    if [ $? -ne 0 ]; then
-        echo "---- Деталі помилки ffmpeg ----" >&2
-        echo "$ffmpeg_err" >&2
-        echo "--------------------------------" >&2
-        fail "ffmpeg не зміг склеїти файли (деталі вище)."
-    fi
+    local total_duration
+    total_duration=$(estimate_concat_duration "$list_file")
+
+    ffmpeg_with_progress "Merging tracks" "$total_duration" \
+        -f concat -safe 0 -i "$list_file" -c copy "$out_file" \
+        || fail "ffmpeg failed to merge files (see details above)."
 }
 
-# Отримати анонімний тимчасовий токен з open.spotify.com (так само, як це робить сам веб-плеєр
-# для відображення сторінки — без логіну, без client_id/secret розробника).
+# Get an anonymous, short-lived token from open.spotify.com (the same one
+# the web player itself uses to render the page — no login, no developer
+# client_id/secret required).
 get_anonymous_spotify_token() {
     local resp token
     resp=$(curl -s "https://open.spotify.com/get_access_token?reason=transport&productType=web_player")
@@ -139,7 +288,7 @@ get_anonymous_spotify_token() {
     echo "$token"
 }
 
-# Витягнути тип (playlist/album/track) та ID з Spotify-URL
+# Extract type (playlist/album/track) and ID from a Spotify URL
 parse_spotify_url() {
     local url="$1"
     if [[ "$url" =~ /playlist/([a-zA-Z0-9]+) ]]; then
@@ -153,8 +302,8 @@ parse_spotify_url() {
     fi
 }
 
-# Отримати повний трек-лист плейлиста/альбому через публічний api.spotify.com/v1
-# (тільки публічні дані, без приватного акаунту користувача).
+# Get the full track list of a playlist/album via the public api.spotify.com/v1
+# (public data only, no user account access).
 get_spotify_playlist_tracks() {
     local kind_id="$1"
     local token="$2"
@@ -175,21 +324,20 @@ get_spotify_playlist_tracks() {
 
         if [ "$kind" == "playlist" ]; then
             echo "$resp" | jq -r '.items[]? | select(.track != null) | "\(.track.artists[0].name) - \(.track.name)"'
-            next=$(echo "$resp" | jq -r '.next // empty')
         else
             echo "$resp" | jq -r '.items[]? | "\(.artists[0].name) - \(.name)"'
-            next=$(echo "$resp" | jq -r '.next // empty')
         fi
+        next=$(echo "$resp" | jq -r '.next // empty')
 
         url="$next"
     done
 }
 
-# Резервний метод №2: витягнути трек-лист просто з HTML-сторінки плейлиста
-# (без жодного API/токена). Spotify вшиває JSON зі станом сторінки прямо в HTML,
-# щоб їхній фронтенд міг намалювати список треків без додаткового запиту.
-# Метод крихкий (ламається, якщо Spotify змінить структуру сторінки),
-# тому використовується тільки якщо метод з API-токеном не спрацював.
+# Fallback method: scrape the track list directly from the playlist's HTML
+# page (no API, no token). Spotify embeds JSON page-state directly in the
+# HTML so its own frontend can render the track list. This is fragile
+# (breaks if Spotify changes the page structure), so it's only used if the
+# API-token method fails.
 get_spotify_tracks_html_scrape() {
     local url="$1"
     local exclude_title="${2:-}"
@@ -201,16 +349,13 @@ get_spotify_tracks_html_scrape() {
 
     [ -z "$html" ] && return 1
 
-    # Спроба №1: знайти пари "артист ... назва треку" у JSON-блоці сторінки.
-    # Шаблон ловить шматки виду:  "artists":[{"name":"АРТИСТ" ... "name":"ТРЕК"
-    # Це не ідеальний парсер JSON, а прицільний regex саме під структуру Spotify-плейлиста.
+    # Attempt #1: find artist/track pairs in the JSON blob.
     local pairs
     pairs=$(echo "$html" | grep -oP '"artists":\[\{"name":"[^"]+".*?"name":"[^"]+"(?=,"album")' 2>/dev/null \
         | grep -oP '"name":"[^"]+"' \
         | cut -d'"' -f4)
 
     if [ -n "$pairs" ]; then
-        # Парні рядки: артист, трек, артист, трек...
         local artist track
         echo "$pairs" | paste -d'|' - - | while IFS='|' read -r artist track; do
             [ -n "$artist" ] && [ -n "$track" ] && echo "${artist} - ${track}"
@@ -218,27 +363,22 @@ get_spotify_tracks_html_scrape() {
         return 0
     fi
 
-    # Спроба №2 (грубий fallback, як у дідовому скрипті v3000-regex):
-    # просто всі "name":"..." з відсіюванням явного сміття. Без чіткого
-    # звʼязку артист/трек, але yt-dlp зазвичай влучає за самою назвою.
-    # ВАЖЛИВО: на сторінці Spotify в JSON є список кодів країн
-    # (availableMarkets) типу "name":"AD","name":"AE" — це НЕ треки,
-    # тому відсіюємо все, що схоже на 2-3-буквений код країни/мови,
-    # а також надто короткі/однослівні службові значення.
+    # Attempt #2 (rough fallback): all "name":"..." values with junk filtered
+    # out. No guaranteed artist/track pairing, but YouTube search usually
+    # still finds the right song from the title alone.
     echo "$html" | grep -oP '"name":"[^"]+"' \
         | cut -d'"' -f4 \
         | grep -v -E '^[A-Z]{2,3}$' \
-        | grep -v -E '^(Spotify|Потужні|Playlist|Premium|Open|spotify:|null|true|false)$' \
+        | grep -v -E '^(Spotify|Playlist|Premium|Open|spotify:|null|true|false)$' \
         | grep -v -E '^[a-z]{2}-[A-Z]{2}$' \
         | { if [ -n "$exclude_title" ]; then grep -vFx "$exclude_title"; else cat; fi; } \
         | sort -u
 }
 
-# Найнадійніший метод: пройти весь плейлист через ВЛАСНИЙ запущений Spotify-клієнт
-# користувача (playerctl читає метадані через D-Bus — це твій локальний плеєр,
-# у якому ти вже залогінений; жодного скрейпінгу чужих серверів, жодної captcha).
-# Вимагає: щоб у користувача був відкритий Spotify-десктоп/веб-клієнт із цим
-# плейлистом, і щоб він натиснув Play на першому треці перед запуском.
+# Most reliable method: step through the whole playlist using the user's
+# OWN running Spotify client (playerctl reads metadata via D-Bus — this is
+# the user's local player, already logged in; no scraping of third-party
+# servers, no captcha involved).
 get_spotify_tracks_via_playerctl() {
     command -v playerctl >/dev/null 2>&1 || return 1
     playerctl --player=spotify status >/dev/null 2>&1 || return 1
@@ -247,9 +387,9 @@ get_spotify_tracks_via_playerctl() {
     > "$tmp_list"
 
     echo "" >&2
-    echo "==> Знайдено активний Spotify-клієнт." >&2
-    echo "==> Переконайся, що в ньому ВІДКРИТО потрібний плейлист і натиснуто Play на ПЕРШІЙ пісні." >&2
-    read -p "Готовий? Натисни Enter, щоб почати автоматичне перемикання треків... " _
+    log "${C_GREEN}✔${C_RESET} Active Spotify client detected." >&2
+    log "  Make sure the right playlist is OPEN and you've pressed Play on the FIRST track." >&2
+    read -p "Ready? Press Enter to start automatically stepping through tracks... " _
 
     local counter=0 prev_track="" dup_count=0
     local first_track
@@ -264,19 +404,17 @@ get_spotify_tracks_via_playerctl() {
             continue
         fi
 
-        # Захист від другого кола плейлиста
         if [ "$current_track" == "$first_track" ] && [ "$counter" -gt 5 ]; then
             echo "" >&2
-            echo "==> Коло замкнулося, повернулися до першого треку ($first_track)." >&2
+            log "${C_GREEN}✔${C_RESET} Loop closed — back at the first track ($first_track)." >&2
             break
         fi
 
-        # Захист від зависання Spotify на одному треці
         if [ "$current_track" == "$prev_track" ]; then
             dup_count=$((dup_count + 1))
             if [ "$dup_count" -gt 10 ]; then
                 echo "" >&2
-                echo "==> Spotify завис на одному треці. Зупиняюся." >&2
+                warn "Spotify seems stuck on one track. Stopping." >&2
                 break
             fi
         else
@@ -285,84 +423,79 @@ get_spotify_tracks_via_playerctl() {
 
         echo "$current_track" >> "$tmp_list"
         counter=$((counter + 1))
-        echo "    [$counter] Смикнув: $current_track" >&2
+        log "    [$counter] Captured: $current_track" >&2
 
         prev_track="$current_track"
         playerctl --player=spotify next
         sleep 0.1
     done
 
-    # Прибираємо повтори, зберігаючи порядок
     awk '!seen[$0]++' "$tmp_list"
 }
 
-# ---------- Початок ----------
+# ---------- Main ----------
 
 check_deps
+banner
 
-echo "========================================"
-echo "    ДІДІВ МАГНІТОФОН v5.0 (Reliable)     "
-echo "========================================"
-echo ""
-
-read -p "Встав посилання на плейлист/трек (Spotify або YouTube): " URL
-[ -z "$URL" ] && fail "Йой! Ти ж нічого не ввів, гий би його качка копнула."
+read -p "Paste a playlist/track link (Spotify or YouTube): " URL
+[ -z "$URL" ] && fail "No link provided."
 
 echo ""
-read -p "Як назвемо цей шедевр? " CUSTOM_NAME_RAW
+read -p "Name this project: " CUSTOM_NAME_RAW
 if [ -z "$CUSTOM_NAME_RAW" ]; then
-    CUSTOM_NAME_RAW="Mishanya_Mix"
-    echo "Нічого не придумав? Ну то буде називатися $CUSTOM_NAME_RAW!"
+    CUSTOM_NAME_RAW="my_mix"
+    log "No name given, defaulting to ${C_BOLD}$CUSTOM_NAME_RAW${C_RESET}"
 fi
 CUSTOM_NAME=$(sanitize_name "$CUSTOM_NAME_RAW")
 
 echo ""
-echo "Як хочеш дістати ту музику?"
-echo "1) Одним великим файлом (для платівки в Майнкрафті)"
-echo "2) Різними файлами (кожна пісня окремо)"
-read -p "Твій вибір (1 або 2): " MODE
-[[ "$MODE" =~ ^[12]$ ]] || fail "Треба ввести 1 або 2."
+echo "How do you want the music?"
+echo "1) One merged file"
+echo "2) Separate files (one per track)"
+read -p "Your choice (1 or 2): " MODE
+[[ "$MODE" =~ ^[12]$ ]] || fail "Please enter 1 or 2."
 
 FORMAT_CHOICE=""
 if [ "$MODE" == "1" ]; then
     echo ""
-    echo "Який формат для склеєного мега-файлу?"
+    echo "Output format for the merged file?"
     echo "1) mp3"
-    echo "2) ogg (для платівки в Енігматі/Майнкрафті)"
-    read -p "Твій вибір (1 або 2): " FORMAT_CHOICE
-    [[ "$FORMAT_CHOICE" =~ ^[12]$ ]] || fail "Треба ввести 1 або 2."
+    echo "2) ogg"
+    read -p "Your choice (1 or 2): " FORMAT_CHOICE
+    [[ "$FORMAT_CHOICE" =~ ^[12]$ ]] || fail "Please enter 1 or 2."
 fi
 
 WORK_DIR="${WORK_ROOT}/${CUSTOM_NAME}"
-mkdir -p "$WORK_DIR" || fail "Не вдалося створити папку $WORK_DIR"
+mkdir -p "$WORK_DIR" || fail "Could not create folder $WORK_DIR"
 
 TMP_DIR=$(mktemp -d "/tmp/${TMP_PREFIX}.XXXXXX")
 LIST_FILE="${TMP_DIR}/list.txt"
 TEMP_FINAL="${TMP_DIR}/temp_final.mp3"
 
 echo ""
-echo "==> Запускаємо турбіни..."
+log "${C_BOLD}Starting download...${C_RESET}"
 
 if [[ "$URL" == *"spotify.com"* ]]; then
-    echo "==> Бачу Spotify."
+    log "${C_CYAN}→${C_RESET} Spotify link detected."
 
     if [[ "$URL" == *"/track/"* ]]; then
         TITLE=$(get_spotify_title "$URL")
-        echo "==> Знайдено назву треку: $TITLE"
-        download_by_search "$TITLE" "$WORK_DIR" 1
+        log "${C_CYAN}→${C_RESET} Track found: ${C_BOLD}${TITLE}${C_RESET}"
+        download_by_search "$TITLE" "$WORK_DIR" 1 1 1
     else
         TITLE=$(get_spotify_title "$URL")
-        echo "==> Плейлист/альбом: $TITLE"
+        log "${C_CYAN}→${C_RESET} Playlist/album: ${C_BOLD}${TITLE}${C_RESET}"
 
         TRACKS=()
 
-        echo "==> Пробую метод №1: через твій локальний Spotify-клієнт (playerctl)..."
+        echo "==> Method 1: your local Spotify client (playerctl)..."
         while IFS= read -r line; do
             [ -n "$line" ] && TRACKS+=("$line")
         done < <(get_spotify_tracks_via_playerctl)
 
         if [ "${#TRACKS[@]}" -eq 0 ]; then
-            echo "==> playerctl недоступний або Spotify не запущено. Пробую метод №2: API-токен..."
+            echo "==> playerctl unavailable or Spotify not running. Trying Method 2: API token..."
             KIND_ID=$(parse_spotify_url "$URL")
             TOKEN=$(get_anonymous_spotify_token)
 
@@ -374,7 +507,7 @@ if [[ "$URL" == *"spotify.com"* ]]; then
         fi
 
         if [ "${#TRACKS[@]}" -eq 0 ]; then
-            echo "==> Метод через API не дав результату. Пробую метод №3: HTML-scrape..."
+            echo "==> API method failed. Trying Method 3: HTML scrape..."
             while IFS= read -r line; do
                 [ -n "$line" ] && TRACKS+=("$line")
             done < <(get_spotify_tracks_html_scrape "$URL" "$TITLE")
@@ -382,22 +515,24 @@ if [[ "$URL" == *"spotify.com"* ]]; then
 
         if [ "${#TRACKS[@]}" -eq 0 ]; then
             echo ""
-            echo "Не вдалося автоматично дістати трек-лист (Spotify міг змінити механізм видачі токена)."
-            echo "Введи список треків вручну — кожен у форматі 'Виконавець - Назва',"
-            echo "по одному на рядок. Завершуй введення порожнім рядком."
+            warn "Could not fetch the track list automatically (Spotify may have changed something)."
+            echo "Enter the track list manually — one per line, format 'Artist - Title'."
+            echo "Finish with an empty line."
             echo ""
             while IFS= read -r line; do
                 [ -z "$line" ] && break
                 TRACKS+=("$line")
             done
-            [ "${#TRACKS[@]}" -eq 0 ] && fail "Не введено жодного треку."
+            [ "${#TRACKS[@]}" -eq 0 ] && fail "No tracks entered."
         else
-            echo "==> Знайдено ${#TRACKS[@]} треків автоматично."
+            ok "Found ${#TRACKS[@]} tracks automatically."
         fi
 
+        echo ""
+        TOTAL_TRACKS="${#TRACKS[@]}"
         i=1
         for t in "${TRACKS[@]}"; do
-            download_by_search "$t" "$WORK_DIR" "$i"
+            download_by_search "$t" "$WORK_DIR" "$i" "$i" "$TOTAL_TRACKS"
             i=$((i + 1))
         done
     fi
@@ -405,34 +540,38 @@ else
     download_youtube_url "$URL" "$WORK_DIR"
 fi
 
-# Перевірка, що хоч щось завантажилось
 shopt -s nullglob
 mp3_files=("$WORK_DIR"/*.mp3)
 shopt -u nullglob
-[ "${#mp3_files[@]}" -eq 0 ] && fail "Жодного файлу не завантажено. Перевір посилання/інтернет."
+[ "${#mp3_files[@]}" -eq 0 ] && fail "No files were downloaded. Check the link/your internet connection."
+
+echo ""
+ok "Downloaded ${#mp3_files[@]} file(s) to: $WORK_DIR"
 
 if [ "$MODE" == "2" ]; then
     echo ""
-    echo "==> ВСЕ ГОТОВО! Твої пісні лежать у папці $WORK_DIR окремими файлами."
+    log "${C_GREEN}${C_BOLD}DONE!${C_RESET} Your tracks are in ${C_BOLD}$WORK_DIR${C_RESET} as separate files."
     exit 0
 fi
 
 echo ""
-echo "==> Створюємо список для склеювання..."
+log "${C_BOLD}Merging tracks...${C_RESET}"
 merge_mp3_files "$WORK_DIR" "$LIST_FILE" "$TEMP_FINAL"
 
 if [ "$FORMAT_CHOICE" == "2" ]; then
-    echo "==> Переганяємо в .ogg..."
     RESULT_FILE="${WORK_DIR}/${CUSTOM_NAME}.ogg"
-    ffmpeg -y -i "$TEMP_FINAL" -c:a libvorbis -q:a 5 "$RESULT_FILE" \
-        > /dev/null 2>&1 || fail "Не вдалося перекодувати в ogg."
+    OGG_DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$TEMP_FINAL" 2>/dev/null)
+    OGG_DURATION=${OGG_DURATION%.*}
+    ffmpeg_with_progress "Encoding to .ogg" "$OGG_DURATION" \
+        -i "$TEMP_FINAL" -c:a libvorbis -q:a 5 "$RESULT_FILE" \
+        || fail "Could not transcode to ogg."
 else
     RESULT_FILE="${WORK_DIR}/${CUSTOM_NAME}.mp3"
     mv "$TEMP_FINAL" "$RESULT_FILE"
 fi
 
-echo "==> Прибираємо за собою окремі пісні..."
+log "${C_CYAN}→${C_RESET} Cleaning up individual track files..."
 find "$WORK_DIR" -maxdepth 1 -type f -name '*.mp3' ! -name "$(basename "$RESULT_FILE")" -delete
 
 echo ""
-echo "==> ЧИСТА ПЕРЕМОГА! Файл готовий: $RESULT_FILE"
+log "${C_GREEN}${C_BOLD}DONE!${C_RESET} Your file is ready: ${C_BOLD}$RESULT_FILE${C_RESET}"
